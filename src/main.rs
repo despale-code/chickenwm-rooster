@@ -182,6 +182,80 @@ fn kill_unauthorized_explorer_instances() {
 
 /// Phase 6.2: System Tray & Desktop Host (`Shell_TrayWnd`) so legacy tray apps broadcasting
 /// `Shell_NotifyIcon` (`WM_COPYDATA`) never hang when `explorer.exe` is suppressed.
+/// Reads the balloon text out of a `Shell_NotifyIcon` `WM_COPYDATA` (`TRAYNOTIFYDATAW`, which
+/// carries `NOTIFYICONDATAW` in its fixed 32-bit-compatible layout).
+unsafe fn parse_tray_balloon(lparam: LPARAM) -> Option<chickenwm_core::ipc::Notification> {
+    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+    const NIM_ADD: u32 = 0;
+    const NIM_MODIFY: u32 = 1;
+    const NIF_INFO: u32 = 0x10;
+    const NIIF_ERROR: u32 = 3;
+    let cds = unsafe { (lparam.0 as *const COPYDATASTRUCT).as_ref()? };
+    if cds.dwData != 1 || cds.lpData.is_null() || (cds.cbData as usize) < 944 {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize) };
+    let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+    let wstr_at = |o: usize, chars: usize| {
+        let units: Vec<u16> = bytes[o..o + chars * 2]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&u| u != 0)
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    if u32_at(0) != 0x3475_3423 {
+        return None; // TRAYNOTIFYDATA signature
+    }
+    let message = u32_at(4);
+    let flags = u32_at(20);
+    if !matches!(message, NIM_ADD | NIM_MODIFY) || flags & NIF_INFO == 0 {
+        return None;
+    }
+    let body = wstr_at(296, 256);
+    let title = wstr_at(812, 64);
+    if body.trim().is_empty() && title.trim().is_empty() {
+        return None; // an empty balloon means "hide the balloon"
+    }
+    let info_flags = u32_at(940);
+    // App name: the process that owns the icon's window.
+    let owner = HWND(u32_at(12) as usize as *mut core::ffi::c_void);
+    let mut pid = 0u32;
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(owner, Some(&mut pid)) };
+    let app = process_display_name(pid).unwrap_or_else(|| "App".to_string());
+    Some(chickenwm_core::ipc::Notification {
+        app,
+        title: if title.is_empty() { body.lines().next().unwrap_or_default().to_string() } else { title },
+        body,
+        timeout_secs: None,
+        urgency: (info_flags & 0x0F == NIIF_ERROR).then(|| "critical".to_string()),
+    })
+}
+
+/// "Steam" for steam.exe: the executable's name without extension, capitalized.
+fn process_display_name(pid: u32) -> Option<String> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        if !ok {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        let stem = std::path::Path::new(&path).file_stem()?.to_string_lossy().into_owned();
+        let mut chars = stem.chars();
+        Some(chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or(stem))
+    }
+}
+
 unsafe extern "system" fn shell_tray_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -189,7 +263,16 @@ unsafe extern "system" fn shell_tray_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_COPYDATA {
-        // Acknowledge Shell_NotifyIcon broadcasts with TRUE (1) so callers never block
+        // Shell_NotifyIcon: show balloon text through chickenwm-notify, then acknowledge with
+        // TRUE (1) so callers never block.
+        if let Some(note) = unsafe { parse_tray_balloon(lparam) } {
+            thread::spawn(move || {
+                let _ = chickenwm_core::ipc::send_ipc_command_blocking(
+                    chickenwm_core::ipc::PIPE_NAME_NOTIFY,
+                    &chickenwm_core::ipc::IpcCommand::Notify(note),
+                );
+            });
+        }
         return LRESULT(1);
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -235,7 +318,10 @@ fn spawn_system_tray_host_thread() {
                     }
                     info!("Registered ChickenWM Shell_TrayWnd system tray broadcast host.");
                     let mut msg = MSG::default();
-                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                        windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+                    }
                 }
             }
         });
@@ -348,6 +434,7 @@ async fn main() -> Result<()> {
         WatchedModule::new("chickenwm-binds", "chickenwm-binds.exe"),
         WatchedModule::new("chickenwm-paper", "chickenwm-paper.exe"),
         WatchedModule::new("roobar", "roobar.exe"),
+        WatchedModule::new("chickenwm-notify", "chickenwm-notify.exe"),
     ]));
 
     // Phase 10.2: Supervisor Watchdog (<50ms respawn, 3 crashes in 10s -> emergency restore)
@@ -475,6 +562,14 @@ async fn main() -> Result<()> {
                         let _ = send_ipc_command_to(PIPE_NAME_BAR, &cmd).await;
                         IpcResponse::Ok {
                             message: "Forwarded BarState to roobar".to_string(),
+                        }
+                    }
+                    cmd @ (IpcCommand::Notify(_) | IpcCommand::DismissNotifications | IpcCommand::ToggleNotificationCenter) => {
+                        match send_ipc_command_to(chickenwm_core::ipc::PIPE_NAME_NOTIFY, &cmd).await {
+                            Ok(resp) => resp,
+                            Err(e) => IpcResponse::Error {
+                                message: format!("chickenwm-notify isn't running: {e}"),
+                            },
                         }
                     }
                     IpcCommand::SummonLauncher => {

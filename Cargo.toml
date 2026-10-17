@@ -14,4 +14,4 @@ tracing.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 parking_lot.workspace = true
-windows.workspace = true
+windows = { workspace = true, features = ["Win32_System_DataExchange"] }
