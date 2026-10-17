@@ -80,6 +80,62 @@ struct Cli {
     /// Remove the autostart shell entry (restores explorer.exe as the login shell) and exit.
     #[arg(long = "uninstall-autostart")]
     uninstall_autostart: bool,
+
+    /// Register the scheduled task that starts ChickenWM as administrator without a prompt
+    /// (needs an elevated shell; Settings runs this for you) and exit.
+    #[arg(long = "install-admin-task")]
+    install_admin_task: bool,
+
+    /// Remove that scheduled task and exit.
+    #[arg(long = "remove-admin-task")]
+    remove_admin_task: bool,
+
+    /// Internal: wait for the daemon with this PID to exit before starting (used when an
+    /// existing daemon hands the shell over to this elevated one).
+    #[arg(long = "takeover")]
+    takeover: Option<u32>,
+}
+
+/// Waits (up to `timeout`) for process `pid` to exit.
+fn wait_for_process_exit(pid: u32, timeout: Duration) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    unsafe {
+        if let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            WaitForSingleObject(handle, timeout.as_millis() as u32);
+            let _ = CloseHandle(handle);
+        }
+    }
+}
+
+/// Deliberately restarts every supervised module. Done under the module lock and with the crash
+/// history cleared, so the watchdog neither races the restart nor counts it towards the
+/// "3 crashes in 10 s" explorer failsafe.
+fn restart_modules(modules: &Mutex<Vec<WatchedModule>>) {
+    let mut mods = modules.lock();
+    for m in mods.iter_mut() {
+        if let Some(mut child) = m.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    // Windows the old WM parked on other workspaces would stay hidden forever otherwise.
+    chickenwm_core::failsafe::restore_all_desktop_windows();
+    // Give the window manager's pipe and hooks a moment to be released before respawning.
+    thread::sleep(Duration::from_millis(300));
+    for m in mods.iter_mut() {
+        m.crash_timestamps.clear();
+        m.spawn_child();
+    }
+}
+
+/// Stops the supervised modules and the daemon without restoring explorer, because an elevated
+/// daemon (already launched by the caller) is taking over.
+fn hand_over_shell() -> ! {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    EXPLORER_KILLER_ENABLED.store(false, Ordering::SeqCst);
+    chickenwm_core::failsafe::terminate_modules();
+    std::process::exit(0)
 }
 
 /// Raises the daemon (and thus its whole watchdog/IPC pipeline) to HIGH priority so input and
@@ -380,6 +436,43 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if cli.install_admin_task || cli.remove_admin_task {
+        let exe = std::env::current_exe()?;
+        let res = if cli.install_admin_task {
+            chickenwm_core::elevation::install_admin_task(&exe)
+        } else {
+            chickenwm_core::elevation::remove_admin_task()
+        };
+        return match res {
+            Ok(()) => {
+                println!("ok");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(1)
+            }
+        };
+    }
+
+    // An older daemon is handing the shell over to this (elevated) one: let it finish first.
+    if let Some(pid) = cli.takeover {
+        wait_for_process_exit(pid, Duration::from_secs(15));
+    }
+
+    // One daemon per session, decided before we touch the shell registry or explorer. A second
+    // copy (typically Winlogon relaunching the shell after explorer was closed) idles until the
+    // running daemon exits instead of exiting itself, so Winlogon doesn't keep relaunching it.
+    let wait_ms = if cli.takeover.is_some() { 10_000 } else { 0 };
+    let mut instance_guard = match chickenwm_core::instance::claim_daemon_instance(wait_ms) {
+        chickenwm_core::instance::Instance::Primary(guard) => Some(guard),
+        dup @ chickenwm_core::instance::Instance::Duplicate(_) => {
+            info!("chickenwm-rooster is already running; this copy stays idle");
+            dup.wait_for_exit();
+            return Ok(());
+        }
+    };
+
     // High priority so dragging/tiling stays smooth while apps are busy.
     raise_process_priority();
 
@@ -401,6 +494,39 @@ async fn main() -> Result<()> {
 
     let (_doc, initial_cfg) = bootstrap_config_and_themes()?;
     let start_time = Instant::now();
+
+    // "Run as administrator" is on but we were started normally (e.g. as the login shell): start
+    // the elevated copy (silently through the scheduled task, else via the UAC prompt) and let it
+    // take over. Declining the prompt just carries on unelevated.
+    if initial_cfg.misc.run_as_admin
+        && !cli.no_children
+        && cli.takeover.is_none()
+        && !chickenwm_core::elevation::is_elevated()
+    {
+        if chickenwm_core::elevation::admin_task_exists() {
+            // The task's daemon has no --takeover PID to wait for: let go of the instance
+            // mutex first so it becomes the daemon instead of idling behind us.
+            if let Some(guard) = instance_guard.take() {
+                guard.release();
+            }
+            if chickenwm_core::elevation::start_admin_task() {
+                info!("Started the elevated ChickenWM task; this unelevated daemon exits");
+                return Ok(());
+            }
+            instance_guard = match chickenwm_core::instance::claim_daemon_instance(0) {
+                chickenwm_core::instance::Instance::Primary(guard) => Some(guard),
+                chickenwm_core::instance::Instance::Duplicate(_) => return Ok(()),
+            };
+        }
+        let exe = std::env::current_exe()?;
+        let pid = std::process::id().to_string();
+        match chickenwm_core::elevation::run_elevated(&exe, &["--takeover", &pid], false) {
+            Ok(_) => return Ok(()),
+            Err(e) => warn!("Staying unelevated: {e}"),
+        }
+    }
+    // Held until the process exits.
+    let _instance_guard = instance_guard;
 
     if cli.replace_shell || initial_cfg.misc.suppress_explorer {
         EXPLORER_KILLER_ENABLED.store(true, Ordering::SeqCst);
@@ -504,6 +630,34 @@ async fn main() -> Result<()> {
                     // `exit` dispatcher: shut the whole shell down, not just the WM (the
                     // watchdog would otherwise respawn a WM that exited on its own).
                     IpcCommand::Dispatch(Action::Exit) => graceful_shutdown().await,
+                    IpcCommand::RestartElevated => {
+                        if chickenwm_core::elevation::is_elevated() {
+                            return IpcResponse::Ok {
+                                message: "ChickenWM already runs as administrator".to_string(),
+                            };
+                        }
+                        // Shows the UAC prompt and blocks until it is answered.
+                        let launched = tokio::task::spawn_blocking(|| {
+                            let exe = std::env::current_exe()?;
+                            let pid = std::process::id().to_string();
+                            chickenwm_core::elevation::run_elevated(&exe, &["--takeover", &pid], false)
+                        })
+                        .await;
+                        match launched {
+                            Ok(Ok(_)) => {
+                                // The elevated daemon waits for us to exit, then starts everything.
+                                tokio::spawn(async {
+                                    tokio::time::sleep(Duration::from_millis(150)).await;
+                                    hand_over_shell()
+                                });
+                                IpcResponse::Ok {
+                                    message: "Restarting ChickenWM as administrator".to_string(),
+                                }
+                            }
+                            Ok(Err(e)) => IpcResponse::Error { message: format!("{e:#}") },
+                            Err(e) => IpcResponse::Error { message: e.to_string() },
+                        }
+                    }
                     IpcCommand::RestoreExplorer => {
                         trigger_emergency_restore(true);
                         IpcResponse::Ok {
@@ -611,11 +765,24 @@ async fn main() -> Result<()> {
                         }
                     }
                     IpcCommand::SetCompositorMode { dwm_hook_enabled } => {
-                        cfg_ipc.lock().misc.dwm_hook_enabled = dwm_hook_enabled;
+                        let changed = {
+                            let mut c = cfg_ipc.lock();
+                            let changed = c.misc.dwm_hook_enabled != dwm_hook_enabled;
+                            c.misc.dwm_hook_enabled = dwm_hook_enabled;
+                            changed
+                        };
                         if !dwm_hook_enabled {
                             eject_dwm_hooks();
                         }
-                        let _ = send_ipc_command_to(PIPE_NAME_WM, &cmd).await;
+                        if changed {
+                            // Switching engines live leaves the WM and wallpaper with state from
+                            // the old one, so restart every module on a clean slate. They read
+                            // the already-saved config on startup.
+                            let mods = Arc::clone(&mods_ipc);
+                            let _ = tokio::task::spawn_blocking(move || restart_modules(&mods)).await;
+                        } else {
+                            let _ = send_ipc_command_to(PIPE_NAME_WM, &cmd).await;
+                        }
                         IpcResponse::Ok {
                             message: format!(
                                 "Compositor mode set to {}",
@@ -668,7 +835,7 @@ async fn main() -> Result<()> {
             }
         }) => {
             if let Err(e) = res {
-                error!("IPC server error: {e}");
+                error!("IPC server error: {e:#}");
             }
         }
     }
