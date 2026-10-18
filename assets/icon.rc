@@ -1,0 +1,3 @@
+// The program icon. icon-res.o is this file compiled, so building needs no resource compiler;
+// after changing icon.ico, regenerate it with: windres -O coff -i icon.rc -o icon-res.o
+1 ICON "icon.ico"
