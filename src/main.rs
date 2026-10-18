@@ -312,6 +312,91 @@ fn process_display_name(pid: u32) -> Option<String> {
     }
 }
 
+/// Icons registered with our `Shell_TrayWnd` (`Shell_NotifyIcon`), served to roobar.
+static TRAY: std::sync::Mutex<Vec<chickenwm_core::ipc::TrayIcon>> = std::sync::Mutex::new(Vec::new());
+
+fn tray_icons() -> Vec<chickenwm_core::ipc::TrayIcon> {
+    let mut icons = TRAY.lock().map(|t| t.clone()).unwrap_or_default();
+    // Apps that exited without NIM_DELETE leave their icon behind: drop dead windows.
+    icons.retain(|i| unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(HWND(i.hwnd as usize as *mut core::ffi::c_void)).as_bool() });
+    icons
+}
+
+/// Applies a `Shell_NotifyIcon` add / modify / delete / set-version to `TRAY`.
+unsafe fn track_tray_icon(lparam: LPARAM) {
+    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+    use windows::Win32::UI::WindowsAndMessaging::{CopyIcon, DestroyIcon, HICON};
+    const NIM_ADD: u32 = 0;
+    const NIM_MODIFY: u32 = 1;
+    const NIM_DELETE: u32 = 2;
+    const NIM_SETVERSION: u32 = 4;
+    const NIF_MESSAGE: u32 = 1;
+    const NIF_ICON: u32 = 2;
+    const NIF_TIP: u32 = 4;
+    const NIF_STATE: u32 = 8;
+    let Some(cds) = (unsafe { (lparam.0 as *const COPYDATASTRUCT).as_ref() }) else { return };
+    if cds.dwData != 1 || cds.lpData.is_null() || (cds.cbData as usize) < 812 {
+        return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize) };
+    let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+    if u32_at(0) != 0x3475_3423 {
+        return;
+    }
+    let (message, hwnd, uid, flags) = (u32_at(4), u64::from(u32_at(12)), u32_at(16), u32_at(20));
+    let Ok(mut tray) = TRAY.lock() else { return };
+    let pos = tray.iter().position(|i| i.hwnd == hwnd && i.uid == uid);
+    let free = |icon: u64| {
+        if icon != 0 {
+            let _ = unsafe { DestroyIcon(HICON(icon as usize as *mut core::ffi::c_void)) };
+        }
+    };
+    match message {
+        NIM_DELETE => {
+            if let Some(p) = pos {
+                free(tray.remove(p).icon);
+            }
+        }
+        NIM_SETVERSION => {
+            if let Some(p) = pos {
+                tray[p].version = u32_at(808);
+            }
+        }
+        NIM_ADD | NIM_MODIFY => {
+            if pos.is_none() && message == NIM_MODIFY {
+                return;
+            }
+            let p = pos.unwrap_or_else(|| {
+                let mut pid = 0u32;
+                unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(HWND(hwnd as usize as *mut core::ffi::c_void), Some(&mut pid)) };
+                tray.push(chickenwm_core::ipc::TrayIcon { hwnd, uid, pid, ..Default::default() });
+                tray.len() - 1
+            });
+            let item = &mut tray[p];
+            if flags & NIF_MESSAGE != 0 {
+                item.callback_message = u32_at(24);
+            }
+            if flags & NIF_ICON != 0 {
+                // The app may destroy its icon after this call: keep our own copy.
+                let theirs = HICON(u32_at(28) as usize as *mut core::ffi::c_void);
+                let copy = unsafe { CopyIcon(theirs) }.map(|h| h.0 as usize as u64).unwrap_or(0);
+                free(std::mem::replace(&mut item.icon, copy));
+            }
+            if flags & NIF_TIP != 0 {
+                let units: Vec<u16> = bytes[32..32 + 256].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
+                item.tip = String::from_utf16_lossy(&units);
+            }
+            if flags & NIF_STATE != 0 {
+                let (state, mask) = (u32_at(288), u32_at(292));
+                if mask & 1 != 0 {
+                    item.hidden = state & 1 != 0; // NIS_HIDDEN
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 unsafe extern "system" fn shell_tray_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -319,6 +404,7 @@ unsafe extern "system" fn shell_tray_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_COPYDATA {
+        unsafe { track_tray_icon(lparam) };
         // Shell_NotifyIcon: show balloon text through chickenwm-notify, then acknowledge with
         // TRUE (1) so callers never block.
         if let Some(note) = unsafe { parse_tray_balloon(lparam) } {
@@ -491,6 +577,8 @@ async fn main() -> Result<()> {
 
     // Phase 1.4: Dedicated zero-dependency hardware failsafe listener (`Ctrl + Alt + Shift + Escape`)
     let _failsafe = spawn_emergency_failsafe_thread();
+    // `theme { auto_dark = … }`: light/dark by the clock (or sunset / sunrise).
+    chickenwm_core::theme_tools::spawn_auto_dark_thread();
 
     let (_doc, initial_cfg) = bootstrap_config_and_themes()?;
     let start_time = Instant::now();
@@ -718,7 +806,8 @@ async fn main() -> Result<()> {
                             message: "Forwarded BarState to roobar".to_string(),
                         }
                     }
-                    cmd @ (IpcCommand::Notify(_) | IpcCommand::DismissNotifications | IpcCommand::ToggleNotificationCenter) => {
+                    IpcCommand::QueryTray => IpcResponse::Tray(tray_icons()),
+                    cmd @ (IpcCommand::Notify(_) | IpcCommand::DismissNotifications | IpcCommand::ToggleNotificationCenter | IpcCommand::QueryNotificationStatus) => {
                         match send_ipc_command_to(chickenwm_core::ipc::PIPE_NAME_NOTIFY, &cmd).await {
                             Ok(resp) => resp,
                             Err(e) => IpcResponse::Error {
@@ -773,6 +862,14 @@ async fn main() -> Result<()> {
                         };
                         if !dwm_hook_enabled {
                             eject_dwm_hooks();
+                        } else if let Ok(mut exe) = std::env::current_exe() {
+                            exe.set_file_name("chickenwm-dwm-hook.exe");
+                            if exe.exists() {
+                                let _ = Command::new(exe)
+                                    .arg("--inject")
+                                    .creation_flags(CREATE_NO_WINDOW)
+                                    .status();
+                            }
                         }
                         if changed {
                             // Switching engines live leaves the WM and wallpaper with state from
