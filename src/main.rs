@@ -16,8 +16,8 @@ use clap::Parser;
 use chickenwm_core::bootstrap_config_and_themes;
 use chickenwm_core::config::{load_or_init_config, HyprConfig};
 use chickenwm_core::failsafe::{
-    eject_dwm_hooks, is_winlogon_shell_chickenwm, register_files_shell_handler, set_winlogon_shell,
-    spawn_emergency_failsafe_thread, trigger_emergency_restore, DWM_HOOK_ACTIVE,
+    is_winlogon_shell_chickenwm, register_files_shell_handler, set_winlogon_shell,
+    spawn_emergency_failsafe_thread, trigger_emergency_restore,
     EXPLORER_KILLER_ENABLED, FAILSAFE_TRIGGERED,
 };
 use chickenwm_core::handles::SafeHandle;
@@ -111,6 +111,7 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) {
 /// Deliberately restarts every supervised module. Done under the module lock and with the crash
 /// history cleared, so the watchdog neither races the restart nor counts it towards the
 /// "3 crashes in 10 s" explorer failsafe.
+#[allow(dead_code)]
 fn restart_modules(modules: &Mutex<Vec<WatchedModule>>) {
     let mut mods = modules.lock();
     for m in mods.iter_mut() {
@@ -930,44 +931,7 @@ async fn main() -> Result<()> {
                                 .to_string(),
                         }
                     }
-                    IpcCommand::SetCompositorMode { dwm_hook_enabled } => {
-                        let changed = {
-                            let mut c = cfg_ipc.lock();
-                            let changed = c.misc.dwm_hook_enabled != dwm_hook_enabled;
-                            c.misc.dwm_hook_enabled = dwm_hook_enabled;
-                            changed
-                        };
-                        if !dwm_hook_enabled {
-                            eject_dwm_hooks();
-                        } else if let Ok(mut exe) = std::env::current_exe() {
-                            exe.set_file_name("chickenwm-dwm-hook.exe");
-                            if exe.exists() {
-                                let _ = Command::new(exe)
-                                    .arg("--inject")
-                                    .creation_flags(CREATE_NO_WINDOW)
-                                    .status();
-                            }
-                        }
-                        if changed {
-                            // Switching engines live leaves the WM and wallpaper with state from
-                            // the old one, so restart every module on a clean slate. They read
-                            // the already-saved config on startup.
-                            let mods = Arc::clone(&mods_ipc);
-                            let _ = tokio::task::spawn_blocking(move || restart_modules(&mods)).await;
-                        } else {
-                            let _ = send_ipc_command_to(PIPE_NAME_WM, &cmd).await;
-                        }
-                        IpcResponse::Ok {
-                            message: format!(
-                                "Compositor mode set to {}",
-                                if dwm_hook_enabled {
-                                    "Experimental DWM PDB Hook"
-                                } else {
-                                    "Standard Win32/DirectComposition (Anti-Cheat Safe)"
-                                }
-                            ),
-                        }
-                    }
+
                     IpcCommand::SetWallpaper { .. } => {
                         match send_ipc_command_to(PIPE_NAME_PAPER, &cmd).await {
                             Ok(r) => r,
@@ -998,8 +962,6 @@ async fn main() -> Result<()> {
                             active_layout: c.general.layout.clone(),
                             explorer_suppressed: EXPLORER_KILLER_ENABLED.load(Ordering::Relaxed),
                             winlogon_shell_replaced: is_winlogon_shell_chickenwm(),
-                            dwm_hook_enabled: c.misc.dwm_hook_enabled
-                                || DWM_HOOK_ACTIVE.load(Ordering::Relaxed),
                             modules_running: running,
                             monitor_count: mons.len(),
                             client_count,
