@@ -191,6 +191,61 @@ impl WatchedModule {
 }
 
 /// Phase 6.1: Terminates any running `explorer.exe` instances when `EXPLORER_KILLER_ENABLED` is `true`.
+/// Whether another process runs this same executable (e.g. the copy the admin task started).
+fn other_rooster_running() -> bool {
+    let Some(own_name) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    else {
+        return false;
+    };
+    let own_pid = std::process::id();
+    unsafe {
+        let Ok(snap_raw) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return false;
+        };
+        let Some(snap) = SafeHandle::new(snap_raw) else {
+            return false;
+        };
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap.raw(), &mut entry).is_err() {
+            return false;
+        }
+        loop {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+            if entry.th32ProcessID != own_pid
+                && String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case(&own_name)
+            {
+                return true;
+            }
+            if Process32NextW(snap.raw(), &mut entry).is_err() {
+                return false;
+            }
+        }
+    }
+}
+
+/// After `schtasks /run`: waits until the task's elevated daemon announces itself. Gives up early
+/// when no copy of rooster shows up within 3 s (the task failed to start anything) or the copy
+/// that did show up exits again, so the UAC fallback comes without a long pause.
+fn wait_for_admin_task_daemon() -> bool {
+    let started = Instant::now();
+    let mut seen = false;
+    while started.elapsed() < Duration::from_secs(15) {
+        if chickenwm_core::instance::wait_for_daemon_ready(100) {
+            return true;
+        }
+        let running = other_rooster_running();
+        if running {
+            seen = true;
+        } else if seen || started.elapsed() > Duration::from_secs(3) {
+            return chickenwm_core::instance::wait_for_daemon_ready(0);
+        }
+    }
+    false
+}
+
 fn kill_unauthorized_explorer_instances() {
     if !EXPLORER_KILLER_ENABLED.load(Ordering::Relaxed)
         || FAILSAFE_TRIGGERED.load(Ordering::Relaxed)
@@ -559,9 +614,6 @@ async fn main() -> Result<()> {
         }
     };
 
-    // High priority so dragging/tiling stays smooth while apps are busy.
-    raise_process_priority();
-
     // Phase 1.4: Immediate `--restore-explorer` CLI recovery flag
     if cli.restore_explorer {
         trigger_emergency_restore(true);
@@ -575,38 +627,39 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Phase 1.4: Dedicated zero-dependency hardware failsafe listener (`Ctrl + Alt + Shift + Escape`)
-    let _failsafe = spawn_emergency_failsafe_thread();
-    // `theme { auto_dark = … }`: light/dark by the clock (or sunset / sunrise).
-    chickenwm_core::theme_tools::spawn_auto_dark_thread();
-
     let (_doc, initial_cfg) = bootstrap_config_and_themes()?;
-    let start_time = Instant::now();
 
     // "Run as administrator" is on but we were started normally (e.g. as the login shell): start
     // the elevated copy (silently through the scheduled task, else via the UAC prompt) and let it
-    // take over. Declining the prompt just carries on unelevated.
+    // take over. Declining the prompt just carries on unelevated. This runs before anything else
+    // is started, so the elevated copy can claim the failsafe hotkey and nothing runs twice.
     if initial_cfg.misc.run_as_admin
         && !cli.no_children
         && cli.takeover.is_none()
         && !chickenwm_core::elevation::is_elevated()
     {
-        if chickenwm_core::elevation::admin_task_exists() {
+        let exe = std::env::current_exe()?;
+        // Only trust the task when it starts this very exe: one registered from another install
+        // location "starts" fine but runs nothing, and we'd exit leaving no shell at all.
+        if chickenwm_core::elevation::admin_task_runs(&exe) {
             // The task's daemon has no --takeover PID to wait for: let go of the instance
             // mutex first so it becomes the daemon instead of idling behind us.
             if let Some(guard) = instance_guard.take() {
                 guard.release();
             }
-            if chickenwm_core::elevation::start_admin_task() {
-                info!("Started the elevated ChickenWM task; this unelevated daemon exits");
+            if chickenwm_core::elevation::start_admin_task() && wait_for_admin_task_daemon() {
+                info!("The elevated ChickenWM task took over; this unelevated daemon exits");
                 return Ok(());
             }
+            warn!("The elevated ChickenWM task did not come up; asking for administrator rights instead");
             instance_guard = match chickenwm_core::instance::claim_daemon_instance(0) {
                 chickenwm_core::instance::Instance::Primary(guard) => Some(guard),
+                // It came up late after all.
                 chickenwm_core::instance::Instance::Duplicate(_) => return Ok(()),
             };
+        } else if chickenwm_core::elevation::admin_task_exists() {
+            warn!("The elevated ChickenWM task starts another program; asking for administrator rights (it is re-registered once elevated)");
         }
-        let exe = std::env::current_exe()?;
         let pid = std::process::id().to_string();
         match chickenwm_core::elevation::run_elevated(&exe, &["--takeover", &pid], false) {
             Ok(_) => return Ok(()),
@@ -615,6 +668,30 @@ async fn main() -> Result<()> {
     }
     // Held until the process exits.
     let _instance_guard = instance_guard;
+    // Tells an unelevated rooster that handed over to us that we really are up.
+    chickenwm_core::instance::announce_daemon_ready();
+
+    // High priority so dragging/tiling stays smooth while apps are busy.
+    raise_process_priority();
+    // Phase 1.4: Dedicated zero-dependency hardware failsafe listener (`Ctrl + Alt + Shift + Escape`)
+    let _failsafe = spawn_emergency_failsafe_thread();
+    // `theme { auto_dark = … }`: light/dark by the clock (or sunset / sunrise).
+    chickenwm_core::theme_tools::spawn_auto_dark_thread();
+    let start_time = Instant::now();
+
+    // Elevated with "Run as administrator" on: make sure the no-prompt task starts *this* exe, so
+    // the next sign-in doesn't hand over to a missing or outdated copy.
+    if initial_cfg.misc.run_as_admin && chickenwm_core::elevation::is_elevated() {
+        thread::spawn(|| {
+            let Ok(exe) = std::env::current_exe() else { return };
+            if !chickenwm_core::elevation::admin_task_runs(&exe) {
+                match chickenwm_core::elevation::install_admin_task(&exe) {
+                    Ok(()) => info!("Re-registered the elevated ChickenWM task for {}", exe.display()),
+                    Err(e) => warn!("Could not re-register the elevated ChickenWM task: {e:#}"),
+                }
+            }
+        });
+    }
 
     if cli.replace_shell || initial_cfg.misc.suppress_explorer {
         EXPLORER_KILLER_ENABLED.store(true, Ordering::SeqCst);
