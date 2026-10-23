@@ -722,6 +722,8 @@ async fn main() -> Result<()> {
 
     let shared_cfg = Arc::new(Mutex::new(initial_cfg));
     let modules: Arc<Mutex<Vec<WatchedModule>>> = Arc::new(Mutex::new(vec![
+        WatchedModule::new("coop", "coop.exe"),
+        WatchedModule::new("chickenscope", "chickenscope.exe"),
         WatchedModule::new("chickenwm-wm", "chickenwm-wm.exe"),
         WatchedModule::new("chickenwm-binds", "chickenwm-binds.exe"),
         WatchedModule::new("chickenwm-paper", "chickenwm-paper.exe"),
@@ -767,6 +769,10 @@ async fn main() -> Result<()> {
                             );
                             trigger_emergency_restore(true);
                             return;
+                        }
+
+                        if m.name == "coop" {
+                            chickenwm_core::failsafe::restore_all_desktop_windows();
                         }
 
                         warn!(
