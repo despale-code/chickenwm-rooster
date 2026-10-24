@@ -554,6 +554,8 @@ fn execute_exec_once_commands(cfg: &HyprConfig) {
             || lower.starts_with("chickenwm-wm")
             || lower.starts_with("chickenwm-binds")
             || lower.starts_with("roobar")
+            || lower.starts_with("chickenwm-notify")
+            || lower.starts_with("chickenwm-downloader")
         {
             continue;
         }
@@ -777,6 +779,7 @@ async fn main() -> Result<()> {
         WatchedModule::new("chickenwm-paper", "chickenwm-paper.exe"),
         WatchedModule::new("roobar", "roobar.exe"),
         WatchedModule::new("chickenwm-notify", "chickenwm-notify.exe"),
+        WatchedModule::new("chickenwm-downloader", "chickenwm-downloader.exe"),
     ]));
 
     // Phase 10.2: Supervisor Watchdog (<50ms respawn, 3 crashes in 10s -> emergency restore)
@@ -939,11 +942,11 @@ async fn main() -> Result<()> {
                         }
                     }
                     IpcCommand::QueryTray => IpcResponse::Tray(tray_icons()),
-                    IpcCommand::AddDownload { .. } => {
+                    cmd @ (IpcCommand::AddDownload { .. } | IpcCommand::ToggleDownloaderCenter | IpcCommand::QueryDownloaderStatus) => {
                         match send_ipc_command_to(chickenwm_core::ipc::PIPE_NAME_DOWNLOADER, &cmd).await {
                             Ok(resp) => resp,
-                            Err(_) => IpcResponse::Ok {
-                                message: "Forwarded download request".to_string(),
+                            Err(e) => IpcResponse::Error {
+                                message: format!("chickenwm-downloader isn't running: {e}"),
                             },
                         }
                     }
