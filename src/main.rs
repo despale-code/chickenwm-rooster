@@ -178,12 +178,23 @@ impl WatchedModule {
     }
 
     fn spawn_child(&mut self) -> bool {
+        use std::process::Stdio;
         let mut exe_path = std::env::current_exe().unwrap_or_default();
         exe_path.set_file_name(self.exe_name);
         let res = if exe_path.exists() {
-            Command::new(&exe_path).creation_flags(CREATE_NO_WINDOW).spawn()
+            Command::new(&exe_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
         } else {
-            Command::new(self.exe_name).creation_flags(CREATE_NO_WINDOW).spawn()
+            Command::new(self.exe_name)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
         };
         match res {
             Ok(c) => {
@@ -657,6 +668,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Detach from any launching terminal console before entering background daemon mode so child
+    // processes never inherit a stale console handle (`0xC0000142` STATUS_DLL_INIT_FAILED).
+    unsafe {
+        let _ = windows::Win32::System::Console::FreeConsole();
+    }
+
     let (_doc, initial_cfg) = bootstrap_config_and_themes()?;
 
     // "Run as administrator" is on but we were started normally (e.g. as the login shell): start
@@ -922,6 +939,14 @@ async fn main() -> Result<()> {
                         }
                     }
                     IpcCommand::QueryTray => IpcResponse::Tray(tray_icons()),
+                    IpcCommand::AddDownload { .. } => {
+                        match send_ipc_command_to(chickenwm_core::ipc::PIPE_NAME_DOWNLOADER, &cmd).await {
+                            Ok(resp) => resp,
+                            Err(_) => IpcResponse::Ok {
+                                message: "Forwarded download request".to_string(),
+                            },
+                        }
+                    }
                     cmd @ (IpcCommand::Notify(_) | IpcCommand::DismissNotifications | IpcCommand::ToggleNotificationCenter | IpcCommand::QueryNotificationStatus) => {
                         match send_ipc_command_to(chickenwm_core::ipc::PIPE_NAME_NOTIFY, &cmd).await {
                             Ok(resp) => resp,
