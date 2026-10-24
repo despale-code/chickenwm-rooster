@@ -90,6 +90,14 @@ struct Cli {
     #[arg(long = "remove-admin-task")]
     remove_admin_task: bool,
 
+    /// Phase 1.4: Disable redundant background Windows services (WSearch, SysMain, DiagTrack, etc.) and exit.
+    #[arg(long = "debloat-services")]
+    debloat_services: bool,
+
+    /// Phase 1.4: Restore debloated Windows services to demand-start and exit.
+    #[arg(long = "restore-services")]
+    restore_services: bool,
+
     /// Internal: wait for the daemon with this PID to exit before starting (used when an
     /// existing daemon hands the shell over to this elevated one).
     #[arg(long = "takeover")]
@@ -529,7 +537,9 @@ fn execute_exec_once_commands(cfg: &HyprConfig) {
     for cmd_line in &cfg.exec_once {
         // Core supervised modules are managed by the watchdog directly
         let lower = cmd_line.to_ascii_lowercase();
-        if lower.starts_with("chickenwm-paper")
+        if lower.starts_with("coop")
+            || lower.starts_with("chickenscope")
+            || lower.starts_with("chickenwm-paper")
             || lower.starts_with("chickenwm-wm")
             || lower.starts_with("chickenwm-binds")
             || lower.starts_with("roobar")
@@ -564,9 +574,26 @@ async fn main() -> Result<()> {
     init_tracing("chickenwm_rooster");
     let cli = Cli::parse();
 
+    if cli.debloat_services || cli.restore_services {
+        let disable = cli.debloat_services;
+        match chickenwm_core::failsafe::debloat_redundant_services(disable) {
+            Ok(svcs) => {
+                let action = if disable { "disabled" } else { "restored to demand-start" };
+                println!("ok: {action} {} service(s): {}", svcs.len(), svcs.join(", "));
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if cli.install_autostart {
         let exe = std::env::current_exe()?.to_string_lossy().into_owned();
         set_winlogon_shell(true, Some(&exe))?;
+        let _ = chickenwm_core::failsafe::set_uac_prompt_on_secure_desktop(false);
+        let _ = chickenwm_core::failsafe::set_disable_lock_workstation(true);
         println!("ok: ChickenWM set as the login shell. It will start automatically at your next login.");
         println!("     exe: {exe}");
         println!("     undo: chickenwm-rooster --uninstall-autostart  (or Ctrl+Alt+Shift+Esc)");
@@ -574,6 +601,8 @@ async fn main() -> Result<()> {
     }
     if cli.uninstall_autostart {
         set_winlogon_shell(false, None)?;
+        let _ = chickenwm_core::failsafe::set_uac_prompt_on_secure_desktop(true);
+        let _ = chickenwm_core::failsafe::set_disable_lock_workstation(false);
         println!("ok: autostart removed; explorer.exe restored as the login shell.");
         return Ok(());
     }
@@ -699,6 +728,8 @@ async fn main() -> Result<()> {
     }
     if cli.replace_shell || initial_cfg.misc.replace_winlogon_shell {
         let _ = set_winlogon_shell(true, None);
+        let _ = chickenwm_core::failsafe::set_uac_prompt_on_secure_desktop(false);
+        let _ = chickenwm_core::failsafe::set_disable_lock_workstation(true);
     }
     if initial_cfg.misc.register_files_handler {
         let _ = register_files_shell_handler(true, None);
